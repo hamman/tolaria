@@ -75,6 +75,44 @@ struct ShellGitConfig {
     path: Option<OsString>,
 }
 
+// Sentinels used when probing the user's login shell for git's location
+// and PATH. The parser picks up only lines that start with these prefixes,
+// so unrelated stdout from the shell's startup files (e.g. `Agent pid …`
+// from ssh-agent, oh-my-zsh banners, plugin status lines) cannot be
+// misassigned to the wrong field.
+const GIT_PATH_SENTINEL_PREFIX: &str = "__TOLARIA_GIT_PROBE_PATH__=";
+const PATH_ENV_SENTINEL_PREFIX: &str = "__TOLARIA_GIT_PROBE_ENV__=";
+
+fn parse_shell_git_config(stdout: &str) -> Option<ShellGitConfig> {
+    let mut git_path: Option<PathBuf> = None;
+    let mut path: Option<OsString> = None;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix(GIT_PATH_SENTINEL_PREFIX) {
+            let trimmed = value.trim();
+            git_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(trimmed))
+            };
+        } else if let Some(value) = line.strip_prefix(PATH_ENV_SENTINEL_PREFIX) {
+            let trimmed = value.trim();
+            path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(OsString::from(trimmed))
+            };
+        }
+    }
+
+    if git_path.is_none() && path.is_none() {
+        return None;
+    }
+
+    Some(ShellGitConfig { git_path, path })
+}
+
 pub(crate) fn git_command() -> Command {
     let config = git_launch_config();
     let mut command = crate::hidden_command(&config.program);
@@ -152,9 +190,15 @@ fn shell_git_config() -> Option<ShellGitConfig> {
 
 #[cfg(target_os = "macos")]
 fn shell_git_config_from_shell(shell: &Path) -> Option<ShellGitConfig> {
+    let script = format!(
+        "printf '{git_prefix}%s\\n{path_prefix}%s\\n' \"$(command -v git 2>/dev/null || true)\" \"$PATH\"",
+        git_prefix = GIT_PATH_SENTINEL_PREFIX,
+        path_prefix = PATH_ENV_SENTINEL_PREFIX,
+    );
+
     let output = crate::hidden_command(shell)
         .arg("-lc")
-        .arg("printf '%s\\n%s' \"$(command -v git 2>/dev/null || true)\" \"$PATH\"")
+        .arg(&script)
         .output()
         .ok()?;
 
@@ -163,24 +207,16 @@ fn shell_git_config_from_shell(shell: &Path) -> Option<ShellGitConfig> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let git_path = lines
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.exists());
-    let path = lines
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(OsString::from);
+    let mut config = parse_shell_git_config(&stdout)?;
+    // The parser is intentionally pure; verify the reported git binary
+    // actually exists on disk before we trust it.
+    config.git_path = config.git_path.filter(|path| path.exists());
 
-    if git_path.is_none() && path.is_none() {
+    if config.git_path.is_none() && config.path.is_none() {
         return None;
     }
 
-    Some(ShellGitConfig { git_path, path })
+    Some(config)
 }
 
 #[cfg(target_os = "macos")]
@@ -454,6 +490,67 @@ mod tests {
         let config = git_launch_config_from_parts(Some(OsString::from("/usr/bin:/bin")), None);
 
         assert_eq!(config.program, OsString::from("git"));
+        assert_eq!(config.path, Some(OsString::from("/usr/bin:/bin")));
+    }
+
+    #[test]
+    fn test_parse_shell_git_config_extracts_sentinel_lines_when_clean() {
+        let stdout = "\
+__TOLARIA_GIT_PROBE_PATH__=/usr/bin/git
+__TOLARIA_GIT_PROBE_ENV__=/opt/homebrew/bin:/usr/bin:/bin
+";
+
+        let config = parse_shell_git_config(stdout).expect("expected parsed config");
+
+        assert_eq!(config.git_path, Some(PathBuf::from("/usr/bin/git")));
+        assert_eq!(
+            config.path,
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin:/bin"))
+        );
+    }
+
+    /// Regression: when the user's login shell prints output before our probe
+    /// runs (ssh-agent's `Agent pid 12345`, oh-my-zsh banners, plugin status
+    /// lines, etc.), the old positional parser misassigned the noise to
+    /// git_path and the real git path to PATH, producing
+    /// `Command::new("git")` with `PATH=/usr/bin/git`, which spawns with
+    /// `os error 2`. The sentinel-based parser must skip the noise and
+    /// pick up the prefixed lines wherever they appear.
+    #[test]
+    fn test_parse_shell_git_config_ignores_login_shell_noise_before_sentinels() {
+        let stdout = "\
+Agent pid 98189
+Welcome to oh-my-zsh
+__TOLARIA_GIT_PROBE_PATH__=/usr/bin/git
+__TOLARIA_GIT_PROBE_ENV__=/opt/homebrew/bin:/usr/bin:/bin
+";
+
+        let config = parse_shell_git_config(stdout).expect("expected parsed config");
+
+        assert_eq!(config.git_path, Some(PathBuf::from("/usr/bin/git")));
+        assert_eq!(
+            config.path,
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin:/bin"))
+        );
+    }
+
+    #[test]
+    fn test_parse_shell_git_config_returns_none_when_sentinels_missing() {
+        let stdout = "Agent pid 98189\nrandom shell output\n";
+
+        assert!(parse_shell_git_config(stdout).is_none());
+    }
+
+    #[test]
+    fn test_parse_shell_git_config_treats_empty_sentinel_value_as_missing() {
+        let stdout = "\
+__TOLARIA_GIT_PROBE_PATH__=
+__TOLARIA_GIT_PROBE_ENV__=/usr/bin:/bin
+";
+
+        let config = parse_shell_git_config(stdout).expect("expected parsed config");
+
+        assert_eq!(config.git_path, None);
         assert_eq!(config.path, Some(OsString::from("/usr/bin:/bin")));
     }
 
